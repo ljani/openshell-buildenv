@@ -1,0 +1,130 @@
+name: OpenShell Windows (MXC)
+
+# Builds the native Windows (MXC) OpenShell binaries from the upstream
+# NVIDIA/OpenShell `windows` branch. Mirrors the upstream build job in
+# .github/workflows/windows-msvc.yml, but checks the source out from here.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      openshell_ref:
+        description: NVIDIA/OpenShell branch, tag, or commit to build
+        default: windows
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPENSHELL_DIR: OpenShell-windows
+  # sccache cannot cache incremental Rust compilations, and rust-cache removes
+  # incremental artifacts before saving the target directory.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build-x64:
+    name: Build binaries (x64)
+    # Windows Server 2025 + Visual Studio 2026 Enterprise. The image provides
+    # the MSVC x64 tools, VS Clang (libclang), CMake/Ninja, the Windows SDK,
+    # and rustup; mise and sccache are installed below.
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: OpenShell-windows
+    env:
+      # Authenticates the pinned Z3 release lookup done by z3-sys.
+      READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_VERSION: windows-msvc-x64
+      SCCACHE_CLIENT_SIDE: "1"
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+    steps:
+      # Equivalent of:
+      #   git clone --branch windows https://github.com/NVIDIA/OpenShell.git OpenShell-windows
+      - name: Check out NVIDIA/OpenShell
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NVIDIA/OpenShell
+          ref: ${{ inputs.openshell_ref || 'windows' }}
+          path: ${{ env.OPENSHELL_DIR }}
+          persist-credentials: false
+
+      - name: Record OpenShell revision
+        id: rev
+        run: |
+          $sha = git rev-parse HEAD
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "Building NVIDIA/OpenShell@$sha" >> $env:GITHUB_STEP_SUMMARY
+
+      # mise is only the task runner here (`--skip-tools`); the Rust toolchain
+      # comes from rustup and the C/C++ toolchain from Visual Studio.
+      - name: Install mise
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          install: false
+          experimental: true
+          working_directory: ${{ env.OPENSHELL_DIR }}
+
+      - name: Trust mise config
+        run: mise trust
+
+      # mise.toml sets RUSTC_WRAPPER=sccache; this installs sccache and wires
+      # it to the GitHub Actions cache backend.
+      - name: Configure GHA sccache backend
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Isolate Rust toolchains
+        # rust-cache hashes every installed toolchain, including unused runner defaults.
+        run: '"RUSTUP_HOME=$env:RUNNER_TEMP/openshell-rustup" >> $env:GITHUB_ENV'
+
+      - name: Install Rust toolchain
+        # With no toolchain argument, rustup installs the checked-in
+        # rust-toolchain.toml configuration.
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup set profile minimal
+          rustup toolchain install
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          # Keep rust-cache's cargo metadata calls independent of the compiler
+          # wrapper; build steps still inherit sccache from the job.
+          RUSTC_WRAPPER: ""
+        with:
+          workspaces: ${{ env.OPENSHELL_DIR }} -> target
+          shared-key: windows-msvc-x64
+          cache-targets: "true"
+          cache-on-failure: "true"
+          cache-bin: "false"
+
+      - name: Build release binaries
+        run: mise run --skip-tools windows:build:x64
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      # Keep the four binaries together with the matching libz3.dll staged by
+      # the build task.
+      - name: Upload binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openshell-windows-x64-${{ steps.rev.outputs.sha }}
+          if-no-files-found: error
+          path: |
+            ${{ env.OPENSHELL_DIR }}/target/x86_64-pc-windows-msvc/release/openshell.exe
+            ${{ env.OPENSHELL_DIR }}/target/x86_64-pc-windows-msvc/release/openshell-gateway.exe
+            ${{ env.OPENSHELL_DIR }}/target/x86_64-pc-windows-msvc/release/openshell-supervisor.exe
+            ${{ env.OPENSHELL_DIR }}/target/x86_64-pc-windows-msvc/release/openshell-windows-sandbox.exe
+            ${{ env.OPENSHELL_DIR }}/target/x86_64-pc-windows-msvc/release/libz3.dll
