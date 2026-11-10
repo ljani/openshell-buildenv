@@ -94,6 +94,11 @@ jobs:
           rustup set profile minimal
           rustup toolchain install
           rustup target add x86_64-pc-windows-msvc
+          # rust-toolchain.toml only applies inside the OpenShell checkout, and
+          # the isolated RUSTUP_HOME has no default. rust-cache runs `rustc -vV`
+          # from the workspace root, so make the pinned toolchain the default.
+          $toolchain = ((rustup show active-toolchain) -split '\s+')[0]
+          rustup default $toolchain
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
